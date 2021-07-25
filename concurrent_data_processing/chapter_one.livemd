@@ -1,0 +1,266 @@
+# Concurrent Data Processing Notes
+
+## Chapter 1
+
+```elixir
+defmodule Sender do
+  def emails() do
+    ["emailone@gmail.com", "email2@gmail.com", "email3@gmail.com"]
+  end
+
+  def send_email(email) do
+    Process.sleep(3000)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+
+  def notify_all() do
+    Enum.each(emails(), &send_email/1)
+  end
+end
+```
+
+```elixir
+# commented out to speed up evaluation
+# Sender.send_email("henry@dog.com")
+```
+
+```elixir
+# commented out to speed up evalaution
+# Sender.notify_all()
+```
+
+* Running them all sequentially is slow!
+
+```elixir
+Task.start(fn -> IO.puts("Hello async world!") end)
+```
+
+```elixir
+defmodule Sender do
+  def emails() do
+    ["emailone@gmail.com", "email2@gmail.com", "email3@gmail.com"]
+  end
+
+  def send_email(email) do
+    # Process.sleep(30_000)
+    Process.sleep(300)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+
+  def notify_all() do
+    Enum.each(emails(), &send_email/1)
+  end
+end
+```
+
+```elixir
+# will timeout as default timeout for
+# await is 5 seconds
+# can pass timeout to await (or :infinity)
+Task.async(fn -> Sender.send_email("hi@world.com") end)
+|> Task.await()
+```
+
+```elixir
+# evalutates to nil when no response is returned
+# cannot pass infinity
+# result is only returned once, otherwise nil is returned
+Task.async(fn -> Sender.send_email("hi@world.com") end)
+|> Task.yield()
+```
+
+### Yield
+
+* Should be used with `Task.shutdown` because after timeout the process continues
+
+### Await
+
+* Can be used without `Task.shutdown` but raises exception when timeout occurs
+
+### `async_stream/3`
+
+Used to combine `Enum.map` and `Task.async` with the benefit of being able to limit the number of processes running at the same time
+
+```elixir
+# Stream example
+Stream.map([1, 2, 3], &(&1 * 2))
+```
+
+### Streams
+
+* Can be evaluated by calling `Enum.to_list` with them (or `Enum.reduce`)
+* By default `async_stream` the limit of processes is set by the number of logical cores available
+  * e.g. `Task.async_stream(task, max_concurrency: 5)`
+* Can use `ordered: false` opt to stop the process from waiting on long processes (and reorder the results)
+* Can pass `on_timeout` opt with `:kill_task` to ignore process timeouts
+
+```elixir
+# now with streams
+defmodule Sender do
+  def emails() do
+    ["emailone@gmail.com", "email2@gmail.com", "email3@gmail.com"]
+  end
+
+  def send_email(email) do
+    Process.sleep(3_000)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+
+  def notify_all(emails) do
+    emails
+    |> Task.async_stream(&send_email/1)
+    |> Enum.to_list()
+  end
+end
+```
+
+```elixir
+Sender.emails() |> Sender.notify_all()
+```
+
+### Linking Processes
+
+* task processes are auto linked to the process that started them
+  * called a process link
+* process links help immediately shut down parts of the system to prevent app from running in bad state
+* when a linked process exits, the other processes are notified (and will exit by default)
+
+#### Process Trapping
+
+* trapping an exit means acknowledging the exit message of the exit mesage, but continuing to run instead of terminating
+*
+
+### Supervisors
+
+* offer a mechanism for starting and stopping processes (and trapping exits)
+
+```elixir
+defmodule Application do
+  def start(_type, _args) do
+    children = [
+      {Task.Supervisor, name: Sender.EmailTaskSupervisor}
+    ]
+
+    opts = [strategy: :one_for_one, name: Sender.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+
+# or 
+
+defmodule Application do
+  def start(_type, _args) do
+    children = [
+      %{
+        id: Sender.EmailTaskSupervisor,
+        start: {
+          Task.Supervisor,
+          :start_link,
+          [[name: Sender.EmailTaskSupervisor]]
+        }
+      }
+    ]
+
+    opts = [strategy: :one_for_one, name: Sender.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+```elixir
+# intentionally cause a crash!
+defmodule Sender do
+  def emails() do
+    ["emailone@gmail.com", "email2@gmail.com", "email3@gmail.com", "kon@world.com"]
+  end
+
+  def send_email("kon@world.com"), do: raise("Oops, could not send email")
+
+  def send_email(email) do
+    Process.sleep(3_000)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+
+  def notify_all(emails) do
+    emails
+    |> Task.async_stream(&send_email/1)
+    |> Enum.to_list()
+  end
+end
+```
+
+```elixir
+self()
+
+try do
+  :ok
+  # Sender.notify_all(["hello@sda.com", "kon@world.com"])
+rescue
+  e ->
+    IO.puts("oops")
+    IO.inspect(e)
+end
+```
+
+### Now With A Supervisor!
+
+```elixir
+defmodule Application do
+  def start(_type, _args) do
+    children = [
+      {Task.Supervisor, name: Sender.EmailTaskSupervisor}
+    ]
+
+    opts = [strategy: :one_for_one, name: Sender.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+
+# intentionally cause a crash!
+defmodule Sender do
+  def emails() do
+    ["emailone@gmail.com", "email2@gmail.com", "email3@gmail.com", "kon@world.com"]
+  end
+
+  def send_email("kon@world.com"), do: raise("Oops, could not send email")
+
+  def send_email(email) do
+    Process.sleep(3_000)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+
+  def notify_all() do
+    emails = emails()
+
+    Sender.EmailTaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(emails, &send_email/1)
+    |> Enum.to_list()
+  end
+end
+```
+
+```elixir
+# now use the supervisor!
+Application.start(:ok, :ok)
+
+# wow better error messages!
+Sender.notify_all()
+```
+
+### Let it Crash
+
+* in practice you should provide error handling when you expect an error to occur, leave the rest to the supervisor
+* Rather than writing extensive defensive code, elixir focused on how to recover from crashes vs how to prevent them all
+
+#### Supervisors can Restart Processes
+
+* `:temporary` will never restart child processes
+* `:transient` will restart child processes only when they exit with an error
+* `:permanent` will always restart children, keeping them running even when they try to shutdown without an error
+* If a `:transient` or `:permanent` restart value is used and a process keeps crashing, the supervisor will exit, because it has failed to restart that process
+* The `Task.Supervisor` module uses `:temporary` as a default restart value
