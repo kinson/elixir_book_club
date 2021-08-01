@@ -75,3 +75,573 @@ defmodule SendServer do
   end
 end
 ```
+
+```elixir
+{:ok, pid} = GenServer.start(SendServer, max_retries: 1)
+
+GenServer.call(pid, :get_state)
+```
+
+Now implement sending emails with handle cast!
+
+```elixir
+defmodule Sender do
+  def emails() do
+    ["emailone@gmail.com", "email2@gmail.com", "email3@gmail.com"]
+  end
+
+  def send_email(email) do
+    Process.sleep(1_000)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+
+  def notify_all(emails) do
+    emails
+    |> Task.async_stream(&send_email/1)
+    |> Enum.to_list()
+  end
+end
+
+defmodule SendServer do
+  use GenServer
+
+  def init(args) do
+    IO.puts("Received Args #{inspect(args)}")
+    max_retries = Keyword.get(args, :max_retries, 5)
+    state = %{emails: [], max_retries: max_retries}
+    {:ok, state}
+  end
+
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
+  end
+
+  def handle_cast({:send, email}, state) do
+    Sender.send_email(email)
+    emails = [%{email: email, status: "send", retries: 0}] ++ state.emails
+
+    {:noreply, %{state | emails: emails}}
+  end
+end
+```
+
+```elixir
+# try out sending emails with GenServer
+{:ok, pid} = GenServer.start(SendServer, max_retries: 1)
+
+GenServer.cast(pid, {:send, "hello@gmail.com"})
+```
+
+```elixir
+defmodule Sender do
+  def emails() do
+    ["emailone@gmail.com", "email2@gmail.com", "email3@gmail.com"]
+  end
+
+  def send_email("bademail@gmail.com"), do: :error
+
+  def send_email(email) do
+    Process.sleep(1_000)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+
+  def notify_all(emails) do
+    emails
+    |> Task.async_stream(&send_email/1)
+    |> Enum.to_list()
+  end
+end
+
+defmodule SendServer do
+  use GenServer
+
+  def init(args) do
+    IO.puts("Received Args #{inspect(args)}")
+    max_retries = Keyword.get(args, :max_retries, 5)
+    state = %{emails: [], max_retries: max_retries}
+
+    Process.send_after(self(), :retry, 5000)
+    {:ok, state}
+  end
+
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
+  end
+
+  def handle_cast({:send, email}, state) do
+    status =
+      case Sender.send_email(email) do
+        {:ok, "email_sent"} -> "sent"
+        :error -> "failed"
+      end
+
+    emails = [%{email: email, status: status, retries: 0}] ++ state.emails
+
+    {:noreply, %{state | emails: emails}}
+  end
+
+  def handle_info(:retry, state) do
+    {failed, done} =
+      Enum.split_with(state.emails, fn item ->
+        item.status == "failed" && item.retries < state.max_retries
+      end)
+
+    retried =
+      Enum.map(failed, fn item ->
+        IO.puts("retrying email #{item.email}...")
+
+        new_status =
+          case Sender.send_email(item.email) do
+            {:ok, "email_sent"} -> "sent"
+            :error -> "failed"
+          end
+
+        %{email: item.email, status: new_status, retries: item.retries + 1}
+      end)
+
+    Process.send_after(self(), :retry, 5000)
+
+    {:noreply, %{state | emails: retried ++ done}}
+  end
+end
+```
+
+```elixir
+{:ok, pid} = GenServer.start(SendServer, max_retries: 1)
+
+GenServer.cast(pid, {:send, "hello@world.com"})
+
+GenServer.cast(pid, {:send, "bademail@gmail.com"})
+```
+
+### Process Teardown
+
+* `terminate/2` is a callback usually invoked before the process exists, but only when the process *itself* is responsible for the exit
+  * Most of the time this is the result of ending callback with `{:stop...}` (excluding `init/1`) or when an unhandled exception happens in the process
+  * Not invoked when external events cause the process to close (e.g. when the whole application stops)
+  * If you want to ensure that `terminate/2` is always called, use `Process.flag(:trap_exit, true)` on the process, or use `Process.monitor` to perform the work in a separate process
+
+```elixir
+defmodule Sender do
+  def send_email("bademail@gmail.com"), do: :error
+
+  def send_email(email) do
+    Process.sleep(1_000)
+    IO.puts("Email to #{email} sent")
+    {:ok, "email_sent"}
+  end
+end
+
+defmodule SendServer do
+  use GenServer
+
+  def init(args) do
+    IO.puts("Received Args #{inspect(args)}")
+    max_retries = Keyword.get(args, :max_retries, 5)
+    state = %{emails: [], max_retries: max_retries}
+
+    Process.send_after(self(), :retry, 5000)
+    {:ok, state}
+  end
+
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
+  end
+
+  def handle_cast({:send, email}, state) do
+    status =
+      case Sender.send_email(email) do
+        {:ok, "email_sent"} -> "sent"
+        :error -> "failed"
+      end
+
+    emails = [%{email: email, status: status, retries: 0}] ++ state.emails
+
+    {:noreply, %{state | emails: emails}}
+  end
+
+  def handle_info(:retry, state) do
+    {failed, done} =
+      Enum.split_with(state.emails, fn item ->
+        item.status == "failed" && item.retries < state.max_retries
+      end)
+
+    retried =
+      Enum.map(failed, fn item ->
+        IO.puts("retrying email #{item.email}...")
+
+        new_status =
+          case Sender.send_email(item.email) do
+            {:ok, "email_sent"} -> "sent"
+            :error -> "failed"
+          end
+
+        %{email: item.email, status: new_status, retries: item.retries + 1}
+      end)
+
+    Process.send_after(self(), :retry, 5000)
+
+    {:noreply, %{state | emails: retried ++ done}}
+  end
+
+  def terminate(reason, _state) do
+    IO.puts("terminating with reason #{reason}")
+    # return value is not important
+  end
+end
+```
+
+```elixir
+{:ok, pid} = GenServer.start(SendServer, max_retries: 1)
+
+GenServer.stop(pid)
+```
+
+### Process Blocking
+
+* although `handle_cast` will return `:ok` right away, the process still pauses for 3 seconds to send the email
+* all of these messages will be put in the processes message queue and execute one-by-one
+* By default, `GenServer.call` will error after 5 seconds
+
+#### Taks Module with GenServer
+
+* Free up GenServer process by using `Task.start/1` and `Task.async/2` to run code concurrently
+* When they are done, they will send messages back to `GenServer` which can be handled by `handle_info/2`
+* See `Task.Supervisor.async_nolink/3` for more examples
+
+## Building a Job-Processing System
+
+```elixir
+defmodule Jobber.Job do
+  use GenServer
+
+  defstruct [:work, :id, :max_retries, retries: 0, status: "new"]
+
+  def init(args) do
+    work = Keyword.fetch!(args, :work)
+    id = Keyword.get(args, :id, random_job_id())
+
+    max_retries = Keyword.get(args, :max_retries, 3)
+
+    state = %Jobber.Job{id: id, work: work, max_retries: max_retries}
+
+    {:ok, state, {:continue, :run}}
+  end
+
+  def handle_continue(:run, state) do
+    new_state = state.work.() |> handle_job_result(state)
+
+    if new_state.status == "errored" do
+      Process.send_after(self(), :retry, 5000)
+      {:noreply, new_state}
+    else
+      IO.puts("Job exiting #{state.id}")
+      {:stop, :normal, new_state}
+    end
+  end
+
+  def handle_info(:retry, state) do
+    {:noreply, state, {:continue, :run}}
+  end
+
+  defp handle_job_result({:ok, _data}, state) do
+    IO.puts("Job completed #{state.id}")
+    %Jobber.Job{state | status: "done"}
+  end
+
+  defp handle_job_result(:error, %{status: "new"} = state) do
+    IO.puts("Job errored #{state.id}")
+    %Jobber.Job{state | status: "errored"}
+  end
+
+  defp handle_job_result(:error, %{status: "errored"} = state) do
+    IO.puts("Job retry failed #{state.id}")
+
+    new_state = %Jobber.Job{state | retries: state.retries + 1}
+
+    if new_state.retries == state.max_retries do
+      %Jobber.Job{new_state | status: "failed"}
+    else
+      new_state
+    end
+  end
+
+  defp random_job_id do
+    :crypto.strong_rand_bytes(5)
+    |> Base.url_encode64(padding: false)
+  end
+end
+```
+
+```elixir
+GenServer.start(Jobber.Job,
+  work: fn ->
+    Process.sleep(500)
+    {:ok, []}
+  end
+)
+```
+
+```elixir
+GenServer.start(Jobber.Job,
+  work: fn ->
+    Process.sleep(500)
+    :error
+  end
+)
+```
+
+## Introducing DynamicSupervisor
+
+```elixir
+defmodule Application do
+  def start(_type, _args) do
+    children = [{DynamicSupervisor, strategy: :one_for_one, name: Jobber.JobRunner}]
+    opts = [strategy: :one_for_one, name: Jobber.Supervisor]
+
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+* `strategy` setting isi required and `:one_for_one` is the only one accepted right now
+
+```elixir
+good_job = fn ->
+  Process.sleep(1200)
+  {:ok, []}
+end
+
+bad_job = fn ->
+  Process.sleep(1300)
+  :error
+end
+```
+
+```elixir
+defmodule Jobber do
+  alias Jobber.{JobRunner, Job}
+
+  def start_job(args) do
+    DynamicSupervisor.start_child(JobRunner, {Job, args})
+  end
+end
+```
+
+```elixir
+# fails without start_link defined in `Job`
+Jobber.start_job(work: good_job)
+```
+
+```elixir
+defmodule Jobber.Job do
+  use GenServer
+
+  defstruct [:work, :id, :max_retries, retries: 0, status: "new"]
+
+  def start_link(args) do
+    GenServer.start_link(__MODULE__, args)
+  end
+
+  def init(args) do
+    work = Keyword.fetch!(args, :work)
+    id = Keyword.get(args, :id, random_job_id())
+
+    max_retries = Keyword.get(args, :max_retries, 3)
+
+    state = %Jobber.Job{id: id, work: work, max_retries: max_retries}
+
+    {:ok, state, {:continue, :run}}
+  end
+
+  def handle_continue(:run, state) do
+    new_state = state.work.() |> handle_job_result(state)
+
+    if new_state.status == "errored" do
+      Process.send_after(self(), :retry, 5000)
+      {:noreply, new_state}
+    else
+      IO.puts("Job exiting #{state.id}")
+      {:stop, :normal, new_state}
+    end
+  end
+
+  def handle_info(:retry, state) do
+    {:noreply, state, {:continue, :run}}
+  end
+
+  defp handle_job_result({:ok, _data}, state) do
+    IO.puts("Job completed #{state.id}")
+    %Jobber.Job{state | status: "done"}
+  end
+
+  defp handle_job_result(:error, %{status: "new"} = state) do
+    IO.puts("Job errored #{state.id}")
+    %Jobber.Job{state | status: "errored"}
+  end
+
+  defp handle_job_result(:error, %{status: "errored"} = state) do
+    IO.puts("Job retry failed #{state.id}")
+
+    new_state = %Jobber.Job{state | retries: state.retries + 1}
+
+    if new_state.retries == state.max_retries do
+      %Jobber.Job{new_state | status: "failed"}
+    else
+      new_state
+    end
+  end
+
+  defp random_job_id do
+    :crypto.strong_rand_bytes(5)
+    |> Base.url_encode64(padding: false)
+  end
+end
+```
+
+```elixir
+Application.start([], [])
+Jobber.start_job(work: good_job)
+```
+
+### Fixing Infinite Jobs on Exit
+
+* Update `strategy` to `:transient` so processes exiting normally are not restarted
+
+```elixir
+defmodule Jobber.Job do
+  use GenServer, restart: :transient
+
+  defstruct [:work, :id, :max_retries, retries: 0, status: "new"]
+
+  def start_link(args) do
+    GenServer.start_link(__MODULE__, args)
+  end
+
+  def init(args) do
+    work = Keyword.fetch!(args, :work)
+    id = Keyword.get(args, :id, random_job_id())
+
+    max_retries = Keyword.get(args, :max_retries, 3)
+
+    state = %Jobber.Job{id: id, work: work, max_retries: max_retries}
+
+    {:ok, state, {:continue, :run}}
+  end
+
+  def handle_continue(:run, state) do
+    new_state = state.work.() |> handle_job_result(state)
+
+    if new_state.status == "errored" do
+      Process.send_after(self(), :retry, 5000)
+      {:noreply, new_state}
+    else
+      IO.puts("Job exiting #{state.id}")
+      {:stop, :normal, new_state}
+    end
+  end
+
+  def handle_info(:retry, state) do
+    {:noreply, state, {:continue, :run}}
+  end
+
+  defp handle_job_result({:ok, _data}, state) do
+    IO.puts("Job completed #{state.id}")
+    %Jobber.Job{state | status: "done"}
+  end
+
+  defp handle_job_result(:error, %{status: "new"} = state) do
+    IO.puts("Job errored #{state.id}")
+    %Jobber.Job{state | status: "errored"}
+  end
+
+  defp handle_job_result(:error, %{status: "errored"} = state) do
+    IO.puts("Job retry failed #{state.id}")
+
+    new_state = %Jobber.Job{state | retries: state.retries + 1}
+
+    if new_state.retries == state.max_retries do
+      %Jobber.Job{new_state | status: "failed"}
+    else
+      new_state
+    end
+  end
+
+  defp random_job_id do
+    :crypto.strong_rand_bytes(5)
+    |> Base.url_encode64(padding: false)
+  end
+end
+```
+
+```elixir
+Application.start([], [])
+Jobber.start_job(work: good_job)
+Jobber.start_job(work: bad_job)
+```
+
+```elixir
+doomed_job = fn ->
+  Process.sleep(5000)
+  raise "Boom!"
+end
+```
+
+```elixir
+Application.start([], [])
+# this should throw an exception...
+Jobber.start_job(work: doomed_job)
+```
+
+We can adjust the `max_seconds` before the Supervisor gives up on a process
+
+```elixir
+defmodule Application do
+  def start(_type, _args) do
+    children = [
+      {DynamicSupervisor, strategy: :one_for_one, max_seconds: 30, name: Jobber.JobRunner}
+    ]
+
+    opts = [strategy: :one_for_one, name: Jobber.Supervisor]
+
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+```elixir
+Application.start([], [])
+
+Process.whereis(Jobber.JobRunner)
+
+Jobber.start_job(work: doomed_job)
+
+Process.whereis(Job.JobRunner)
+```
+
+In this example the supervisor pid is changing because the supervisor itself is crashing and being restarted
+
+This happens because the supervisor cannot keep the process from crashing, so the supervisor itself will exit
+
+As a result, any concurrent Job process will also be terminated. Even if a single process fails to be recovered, it could endanger all other running processes.
+
+This can be fixed by adding a supervisor for each Job process which will handle restarts and gracefully exit when its process fails
+
+## Implementing  a Supervisor
+
+To fix the issue above, we will create a supervisor for each job process with a restart value of `temporary` so it does not cause further damage
+
+```elixir
+defmodule Jobber.JobSupervisor do
+  use Supervisor, restart: :temporary
+
+  def start_link(args) do
+    Supervisor.start_link(__MODULE__, args)
+  end
+
+  # need to complete
+  ...
+end
+```
