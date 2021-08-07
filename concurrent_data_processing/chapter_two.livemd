@@ -641,7 +641,211 @@ defmodule Jobber.JobSupervisor do
     Supervisor.start_link(__MODULE__, args)
   end
 
-  # need to complete
-  ...
+  def init(args) do
+    children = [
+      {Jobber.Job, args}
+    ]
+
+    options = [
+      strategy: :one_for_one,
+      max_seconds: 30
+    ]
+
+    Supervisor.init(children, options)
+  end
 end
 ```
+
+```elixir
+# use the new supervisor
+defmodule Jobber do
+  alias Jobber.{JobRunner, JobSupervisor}
+
+  def start_job(args) do
+    DynamicSupervisor.start_child(JobRunner, {JobSupervisor, args})
+  end
+end
+```
+
+```elixir
+# Test it out! (with supervisor)
+
+IO.puts("Process before boom")
+Process.whereis(Jobber.JobRunner) |> IO.inspect()
+
+Jobber.start_job(work: doomed_job)
+
+Process.sleep(2000)
+
+IO.puts("Process after boom")
+Process.whereis(Jobber.JobRunner) |> IO.inspect()
+```
+
+### Supervisor Strategies
+
+When you define a supervisor, you have several options for the strategy that tell them how to manage child processes:
+
+* `:one_for_one`
+  * great when each child process can be restarted independently without impacting sibling processes
+* `:one_for_all`
+  * will restart all child processes when one of them fails
+* `:rest_for_one`
+  * similar to `:one_for_all` but only sibling processes started *after* the failed one will be restarted
+
+## Naming Process Using the Registry
+
+### Three types of acceptable names for processes:
+
+* an atom, like `:job_runner` (or Jobber.JobRunner)
+* a global `{:global, term}` tuple, which registers the process globally
+  * useful for distributed applications
+* a `{:via, module, term}` tuple, where `module` is an Elixir module that would take care of the registration process, using the value term
+
+### `Registry`
+
+* each `Registry` works as a process that is in the supervision tree
+
+```elixir
+defmodule Application do
+  def start(_type, _args) do
+    job_runner_config = [
+      strategy: :one_for_one,
+      max_seconds: 30,
+      name: Jobber.JobRunner
+    ]
+
+    children = [
+      {Registry, keys: :unique, name: Jobber.JobRegistry},
+      {DynamicSupervisor, job_runner_config}
+    ]
+
+    opts = [strategy: :one_for_one, name: Jobber.Supervisor]
+
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+```elixir
+defmodule Jobber.Job do
+  use GenServer, restart: :transient
+
+  defstruct [:work, :id, :max_retries, retries: 0, status: "new"]
+
+  # DIFFERENT!!
+  def start_link(args) do
+    args =
+      if Keyword.has_key?(args, :id) do
+        args
+      else
+        Keyword.put(args, :id, random_job_id())
+      end
+
+    id = Keyword.get(args, :id)
+    type = Keyword.get(args, :type)
+
+    GenServer.start_link(__MODULE__, args, name: via(id, type))
+  end
+
+  def init(args) do
+    work = Keyword.fetch!(args, :work)
+    id = Keyword.get(args, :id)
+
+    max_retries = Keyword.get(args, :max_retries, 3)
+
+    state = %Jobber.Job{id: id, work: work, max_retries: max_retries}
+
+    {:ok, state, {:continue, :run}}
+  end
+
+  def handle_continue(:run, state) do
+    new_state = state.work.() |> handle_job_result(state)
+
+    if new_state.status == "errored" do
+      Process.send_after(self(), :retry, 5000)
+      {:noreply, new_state}
+    else
+      IO.puts("Job exiting #{state.id}")
+      {:stop, :normal, new_state}
+    end
+  end
+
+  def handle_info(:retry, state) do
+    {:noreply, state, {:continue, :run}}
+  end
+
+  defp handle_job_result({:ok, _data}, state) do
+    IO.puts("Job completed #{state.id}")
+    %Jobber.Job{state | status: "done"}
+  end
+
+  defp handle_job_result(:error, %{status: "new"} = state) do
+    IO.puts("Job errored #{state.id}")
+    %Jobber.Job{state | status: "errored"}
+  end
+
+  defp handle_job_result(:error, %{status: "errored"} = state) do
+    IO.puts("Job retry failed #{state.id}")
+
+    new_state = %Jobber.Job{state | retries: state.retries + 1}
+
+    if new_state.retries == state.max_retries do
+      %Jobber.Job{new_state | status: "failed"}
+    else
+      new_state
+    end
+  end
+
+  defp random_job_id do
+    :crypto.strong_rand_bytes(5)
+    |> Base.url_encode64(padding: false)
+  end
+
+  # NEW!!
+  defp via(key, value) do
+    {:via, Registry, {Jobber.JobRegistry, key, value}}
+  end
+end
+```
+
+### Via Format
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defp via(key, value) do
+  {:via, Registry, {Jobber.JobRegistry, key, value}}
+end
+```
+
+Must return a tuple `{:via, Registry, config}` where config is also a tuple and either
+
+* `{registry_process, key}` or
+* `{registry_process, key, value}`
+
+```elixir
+defmodule Jobber do
+  alias Jobber.{JobRunner, JobSupervisor}
+
+  def start_job(args) do
+    DynamicSupervisor.start_child(JobRunner, {JobSupervisor, args})
+  end
+
+  def running_imports() do
+    match_all = {:"$1", :"$2", :"$3"}
+    guards = [{:==, :"$3", "import"}]
+    map_result = [%{id: :"$1", pid: :"$2", type: :"$3"}]
+
+    Registry.select(Jobber.JobRegistry, [{match_all, guards, map_result}])
+  end
+end
+```
+
+#### Registry Select
+
+* takes registry process as first argument followd by a list of match specifications as the last arg
+* `match_all` is a wildcard that matches all entries in the registry
+* `guards` is a filter that filters results by the third element in the tuple which has to equal "import"
+* `map_result` transforms the result by creating a list of maps, assigning each elemt of the tuple to a key, which makes the result more readable
+
+Each value in the Registry is a tuple in the form `{name, pid, value}`
