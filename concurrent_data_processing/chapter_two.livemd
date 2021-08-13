@@ -577,7 +577,7 @@ end
 ```
 
 ```elixir
-Application.start([], [])
+# Application.start([], [])
 Jobber.start_job(work: good_job)
 Jobber.start_job(work: bad_job)
 ```
@@ -849,3 +849,109 @@ end
 * `map_result` transforms the result by creating a list of maps, assigning each elemt of the tuple to a key, which makes the result more readable
 
 Each value in the Registry is a tuple in the form `{name, pid, value}`
+
+```elixir
+defmodule ApplicationWithRegistry do
+  def start(_type, _args) do
+    job_runner_config = [
+      strategy: :one_for_one,
+      max_seconds: 30,
+      name: Jobber.JobRunner
+    ]
+
+    children = [
+      {Registry, keys: :unique, name: Jobber.JobRegistry},
+      {DynamicSupervisor, job_runner_config}
+    ]
+
+    opts = [strategy: :one_for_one, name: Jobber.Supervisor]
+
+    Supervisor.start_link(children, opts)
+  end
+end
+
+# not working ugh
+ApplicationWithRegistry.start([], [])
+
+Process.sleep(1000)
+
+Jobber.start_job(work: good_job, type: "import")
+Jobber.start_job(work: good_job, type: "send_email")
+
+Process.sleep(200)
+
+Jobber.running_imports()
+```
+
+### Limiting Concurrency of Import Jobs
+
+This is how you do it!
+
+```elixir
+defmodule Jobber do
+  alias Jobber.{JobRunner, JobSupervisor}
+
+  def start_job(args) do
+    if Enum.count(running_imports()) >= 5 do
+      {:error, :import_quota_reached}
+    else
+      DynamicSupervisor.start_child(JobRunner, {JobSupervisor, args})
+    end
+  end
+
+  def running_imports() do
+    match_all = {:"$1", :"$2", :"$3"}
+    guards = [{:==, :"$3", "import"}]
+    map_result = [%{id: :"$1", pid: :"$2", type: :"$3"}]
+
+    Registry.select(Jobber.JobRegistry, [{match_all, guards, map_result}])
+  end
+end
+```
+
+```elixir
+defmodule ApplicationWithRegistry do
+  def start(_type, _args) do
+    job_runner_config = [
+      strategy: :one_for_one,
+      max_seconds: 30,
+      name: Jobber.JobRunner
+    ]
+
+    children = [
+      {Registry, keys: :unique, name: Jobber.JobRegistry},
+      {DynamicSupervisor, job_runner_config}
+    ]
+
+    opts = [strategy: :one_for_one, name: Jobber.Supervisor]
+
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+```elixir
+Process.sleep(1000)
+
+Jobber.start_job(work: good_job, type: "import")
+Jobber.start_job(work: good_job, type: "send_email")
+
+Process.sleep(200)
+
+Jobber.running_imports()
+```
+
+## Inspecting Supervisors at Runtime
+
+Two functions that help tell you which processes currently running under a particular supervisor
+
+* `count_children/1` returns map with
+  * `:supervisors`, total number of supervisor child process (active & inactive)
+  * `:workers` totl number of non-supervisor processes
+  * `:specs` total number of all child processe
+  * `:active` total active
+* `which_children/1` returns a list of child process tuples with:
+  * `id` of the process (could be `:undefined`)
+  * `pid` of the process (or `:restarting`)
+  * `type` either worker or supervisor
+  * the module implementation
