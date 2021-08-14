@@ -1,0 +1,22 @@
+# Processing Collections with Flow
+
+## Section
+
+
+
+```elixir
+Mix.install([
+  {:flow, "~> 1.0"},
+  {:nimble_csv, "~> 1.1"}
+])
+```
+
+```elixir
+defmodule Airports do
+  alias NimbleCSV.RFC4180, as: CSV
+
+  def airports_csv() do
+    "/Users/sam/Documents/elixir_book_club/concurrent_data_processing/airports.csv"
+  end
+end
+```
