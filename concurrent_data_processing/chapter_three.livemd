@@ -7,3 +7,460 @@ The name originates from fluid dynamics and automotive industry.
 ## Introducing GenStage
 
 > The demand for more events travels from left to right
+
+There are three types of stages:
+
+1. Producer
+2. Consumer
+3. Producer-Consumer
+
+```elixir
+IO.puts("HELLO")
+
+Mix.install([{:gen_stage, "~> 1.0"}])
+```
+
+```elixir
+# defmodule Scraper do
+#   def work() do
+#     1..5
+#     |> Enum.random()
+#     |> :timer.seconds()
+#     |> Process.sleep()
+#   end
+# end
+```
+
+#### Creating a Producer
+
+The scraper will scrape data from web pages, this will produce urls for consumers interested in getting web pages to scrape.
+
+```elixir
+# defmodule PageProducer do
+#   use GenStage
+#   require Logger
+
+#   def start_link(_args) do
+#     initial_state = []
+#     GenStage.start_link(__MODULE__, initial_state, name: __MODULE__)
+#   end
+
+#   def init(initial_state) do
+#     Logger.info("PageProducer init")
+#     {:producer, initial_state}
+#   end
+
+#   # accepts the number of events requested by a consumer,
+#   # should return the actual events
+#   def handle_demand(demand, state) do
+#     Logger.info("PageProducer receieved demand for #{demand} pages")
+#     events = []
+#     {:noreply, events, state}
+#   end
+
+#   def scrape_pages(pages) when is_list(pages) do
+#     GenStage.cast(__MODULE__, {:pages, pages})
+#   end
+
+#   def handle_cast({:pages, pages}, state) do
+#     {:noreply, pages, state}
+#   end
+# end
+
+# fully specced out consumer
+# defmodule PageConsumer do
+#   use GenStage
+#   require Logger
+
+#   def start_link(_args) do
+#     initial_state = []
+#     GenStage.start_link(__MODULE__, initial_state)
+#   end
+
+#   def init(initial_state) do
+#     Logger.info("PageConsumer init")
+
+#     sub_opts = [{PageProducer, min_demand: 0, max_demand: 1}]
+
+#     {:consumer, initial_state, subscribe_to: sub_opts}
+#   end
+
+#   def handle_events(events, _from, state) do
+#     Logger.info("PageConsumer received #{inspect(events)}")
+
+#     # pretend we are scraping
+#     Enum.each(events, fn _page ->
+#       Scraper.work()
+#     end)
+
+#     {:noreply, [], state}
+#   end
+# end
+
+# defmodule PageConsumer do
+#   require Logger
+
+#   def start_link(event) do
+#     Logger.info("PageConsumer received #{event}")
+
+#     Task.start_link(fn ->
+#       Scraper.work()
+#     end)
+#   end
+# end
+
+# defmodule PageConsumerSupervisor do
+#   use ConsumerSupervisor
+#   require Logger
+
+#   def start_link(_args) do
+#     ConsumerSupervisor.start_link(__MODULE__, :ok)
+#   end
+
+#   def init(:ok) do
+#     Logger.info("PageConsumerSupervisor init")
+
+#     children = [
+#       %{
+#         id: PageConsumer,
+#         start: {PageConsumer, :start_link, []},
+#         restart: :transient
+#       }
+#     ]
+
+#     opts = [
+#       strategy: :one_for_one,
+#       subscribe_to: [{PageProducer, max_demand: 2}]
+#     ]
+
+#     ConsumerSupervisor.init(children, opts)
+#   end
+# end
+
+# defmodule LBApplication do
+#   def start(_type, _args) do
+#     children = [
+#       PageProducer,
+#       # Supervisor.child_spec(PageConsumer, id: :consumer_a),
+#       # Supervisor.child_spec(PageConsumer, id: :consumer_b)
+#       PageConsumerSupervisor
+#     ]
+
+#     opts = [strategy: :one_for_one, name: Scraper.Supervisor]
+
+#     Supervisor.start_link(children, opts)
+#   end
+
+#   def stop do
+#     Supervisor.stop(Scraper.Supervisor)
+#   end
+# end
+```
+
+```elixir
+# LBApplication.stop()
+# Process.sleep(500)
+# IO.puts "Restarting Application"
+# LBApplication.start([], [])
+
+# pages = [
+#   "google.com",
+#   "facebook.com",
+#   "apple.com",
+#   "netflix.com",
+#   "amazon.com"
+# ]
+
+# PageProducer.scrape_pages(pages)
+```
+
+The consumer is greedy and will demand the `max_demand` number of events when it is started.
+
+The consumer will process the first batch using:
+
+```
+events_to_process = max_demand - min_demand
+```
+
+Since max_demand is 1000 by default and min_demand is 500, the consumer will process 500 events first, then the remaining 500.
+
+Then it will demand 500 more from the producer.
+
+#### Callbacks
+
+* `GenStage` has the same callbacks as `GenServer`, but they expect different return tuples
+
+  * `{:reply, reply, [event], new_state}`
+  * `{:noreply, [event], new_state}`
+
+* To improve consumer performance, we can create multiple instances of the same consumer
+
+#### Buffering Events
+
+* Producers have a built-in buffer which is used whenever the number of dispatched events is greater than the total pending demand
+* The default size of the buffer is 10,000 events for stages of the type `:producer`, and `:infinity` for type `:producer_consumer`
+* This can be configured in the return tuple of `init`
+* If buffer_limit is exceeded then events are dropped
+* Can drop events from the end of the queue instead by passing `:buffer_keep` as `:first`
+
+#### ConsumerSupervisor
+
+* `ConsumerSupervisor` is a special type of supervisor, it works like a consumer and can subscribe to one or more producers
+* When it receives a list of events from a producer, it automatically starts a process for each event and passes the event as an arg to that process
+  * When the event is done being processed, new demand will be issued by the Supervisor and the cycle repeats
+* All child processes must exit with reason `:normal` or `:shutdown`, so the supervisor can reissue demand
+  * Should this happen after a single task is complete (???) I thought it would reissue demand automatically
+
+#### Number of Logical Cores At Runtime
+
+* Can use `System.schedulers_online` to find the number of cores available
+
+## Creating Multi-Stage Data Pipelines
+
+* Organizing business logic by stages, rather than plain Elixir modules and function is anti pattern
+
+* Producers always have to be started before the consumers, otherwise consumers cannot subscribe to producers
+
+```elixir
+defmodule Scraper do
+  def work() do
+    1..5
+    |> Enum.random()
+    |> :timer.seconds()
+    |> Process.sleep()
+  end
+
+  def online?(_url) do
+    work()
+
+    Enum.random([false, true, true])
+  end
+end
+
+defmodule PageProducer do
+  use GenStage
+  require Logger
+
+  def start_link(_args) do
+    initial_state = []
+    GenStage.start_link(__MODULE__, initial_state, name: __MODULE__)
+  end
+
+  def init(initial_state) do
+    Logger.info("PageProducer init")
+    {:producer, initial_state}
+  end
+
+  # accepts the number of events requested by a consumer,
+  # should return the actual events
+  def handle_demand(demand, state) do
+    Logger.info("PageProducer receieved demand for #{demand} pages")
+    events = []
+    {:noreply, events, state}
+  end
+
+  def scrape_pages(pages) when is_list(pages) do
+    GenStage.cast(__MODULE__, {:pages, pages})
+  end
+
+  def handle_cast({:pages, pages}, state) do
+    {:noreply, pages, state}
+  end
+end
+
+defmodule PageConsumer do
+  require Logger
+
+  def start_link(event) do
+    Logger.info("PageConsumer received #{event}")
+
+    Task.start_link(fn ->
+      Scraper.work()
+    end)
+  end
+end
+
+defmodule PageConsumerSupervisor do
+  use ConsumerSupervisor
+  require Logger
+
+  def start_link(_args) do
+    ConsumerSupervisor.start_link(__MODULE__, :ok)
+  end
+
+  def init(:ok) do
+    Logger.info("PageConsumerSupervisor init")
+
+    children = [
+      %{
+        id: PageConsumer,
+        start: {PageConsumer, :start_link, []},
+        restart: :transient
+      }
+    ]
+
+    opts = [
+      strategy: :one_for_one,
+      subscribe_to: [
+        {OnlinePageProducerConsumer.via("online_page_producer_consumer_1"), []},
+        {OnlinePageProducerConsumer.via("online_page_producer_consumer_2"), []}
+      ]
+    ]
+
+    ConsumerSupervisor.init(children, opts)
+  end
+end
+
+defmodule OnlinePageProducerConsumer do
+  use GenStage
+  require Logger
+
+  def start_link(id) do
+    initial_state = []
+
+    GenStage.start_link(__MODULE__, initial_state, name: via(id))
+  end
+
+  def init(initial_state) do
+    Logger.info("OnlinePageProducerConsumer init")
+
+    subscription = [
+      {PageProducer, min_demand: 0, max_demand: 1}
+    ]
+
+    {:producer_consumer, initial_state, subscribe_to: subscription}
+  end
+
+  def handle_events(events, _from, state) do
+    Logger.info("OnlinePageProducerConsumer receiveved #{inspect(events)}")
+
+    events = Enum.filter(events, &Scraper.online?/1)
+
+    {:noreply, events, state}
+  end
+
+  def via(id) do
+    {:via, Registry, {ProducerConsumerRegistry, id}}
+  end
+end
+
+defmodule LBApplication do
+  def start(_type, _args) do
+    children = [
+      {Registry, keys: :unique, name: ProducerConsumerRegistry},
+      PageProducer,
+      producer_consumer_spec(id: 1),
+      producer_consumer_spec(id: 2),
+      PageConsumerSupervisor
+    ]
+
+    opts = [strategy: :one_for_one, name: Scraper.Supervisor]
+
+    Supervisor.start_link(children, opts)
+  end
+
+  def stop do
+    Supervisor.stop(Scraper.Supervisor)
+  end
+
+  def producer_consumer_spec(id: id) do
+    id = "online_page_producer_consumer_#{id}"
+    Supervisor.child_spec({OnlinePageProducerConsumer, id}, id: id)
+  end
+end
+```
+
+```elixir
+LBApplication.stop()
+Process.sleep(500)
+IO.puts("Restarting Application")
+LBApplication.start([], [])
+
+pages = [
+  "google.com",
+  "facebook.com",
+  "apple.com",
+  "netflix.com",
+  "amazon.com"
+]
+
+PageProducer.scrape_pages(pages)
+```
+
+#### Scaling Up a Stage with Extra Processes
+
+* Create a `Registry` to keep track of processes
+
+## Choosing the Right Dispatcher
+
+* when `:producer` and `:producer_consumer` stages send events to consumers, it is in fact the dispatcher that takes care of sending the events
+* so far we have used the default `DemandDispatcher`
+* You can specify them when initializing the porcess using the `:dispatcher` key
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+def init(state) do
+  {:producer, state, dispatcher: GenStage.DemandDispatcher}
+end
+```
+
+* `DemandDispatcher` sends events to consumers with the highest demand first
+* `BroadcastDispatcher` sends events supplied by the producer to *all* consumers subscribed to it
+  * this is useful when different types of consumers subscribed to the same producer that needs the same data for different purposes
+  * consumer stages get the ability to filter the events they are receiving by using a `:selector`
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+def init(state) do
+  selector =
+    fn incoming_event ->
+      # return true to select it, false to not
+    end
+  
+  sub_opts = [
+    {SomeProducer, selector: selector}
+  ]
+
+  {:consumer, state, subscribe_to: sub_opts}
+end
+```
+
+* `PartitionDispatcher` leaves the responsibility of deciding the consumer to the producer
+  * examines each event and assigns it to a *partition* (or bucket)
+  * consumers then tell the producer what type of events they want to receive, based on that partition
+  * can ignore events by returning partition `:none`
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+
+def init(state) do
+  hash = 
+    fn event ->
+      # use the event to decide which partition
+      # to assign it to, or use :none to ignore it
+      {event, :c}
+    end
+  
+  opts = [
+    partitions: [:a, :b, :c],
+    hash: hash
+  ]
+
+  {:producer, state, dispatcher: {GenStage.PartitionDispatcher, opts}}
+end
+```
+
+* now consumers can subscribe to one of the partitions
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+sub_opts = [
+  {SomeProducer, partition: :b}
+]
+
+{:consumer, state, subscribe_to: sub_opts}
+```
