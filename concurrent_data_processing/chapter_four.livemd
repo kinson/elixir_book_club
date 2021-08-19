@@ -2,8 +2,6 @@
 
 ## Section
 
-
-
 ```elixir
 Mix.install([
   {:flow, "~> 1.0"},
@@ -12,11 +10,262 @@ Mix.install([
 ```
 
 ```elixir
+# defmodule Airports do
+#   alias NimbleCSV.RFC4180, as: CSV
+
+#   def airports_csv() do
+#     "/Users/sam/Documents/elixir_book_club/concurrent_data_processing/airports.csv"
+#   end
+
+#   def open_airports() do
+#     airports_csv()
+#     |> File.stream!()
+#     |> CSV.parse_stream()
+#     |> Stream.map(fn row ->
+#       %{
+#         # need to use :binary.copy to copy data inside Stream.map
+#         id: :binary.copy(Enum.at(row, 0)),
+#         type: :binary.copy(Enum.at(row, 2)),
+#         name: :binary.copy(Enum.at(row, 3)),
+#         country: :binary.copy(Enum.at(row, 8))
+#       }
+#     end)
+#     |> Stream.reject(&(&1.type == "closed"))
+#     |> Enum.to_list()
+#   end
+
+#   def flow_open_airports() do
+#     airports_csv()
+#     |> File.stream!()
+#     |> Flow.from_enumerable()
+#     |> Flow.map(fn row ->
+#       [row] = CSV.parse_string(row, skip_headers: false)
+
+#       %{
+#         id: Enum.at(row, 0),
+#         type: Enum.at(row, 2),
+#         name: Enum.at(row, 3),
+#         country: Enum.at(row, 8)
+#       }
+#     end)
+#     |> Flow.reject(&(&1.type == "closed"))
+#     |> Enum.to_list()
+#   end
+# end
+```
+
+```elixir
+# :timer.tc(&Airports.open_airports/0)
+:timer.tc(&Airports.flow_open_airports/0)
+```
+
+#### Running Streams Concurrently
+
+* Performance of opening and parsing airports file
+
+  * as a plain enum map: 1.6~ s
+  * as a stream: 0.37~ s
+  * using flow: 0.2~ s
+
+* to use `Flow` we need to convert an existing data source to a *flow*
+
+* `Flow.from_enumberable/2` does this ^
+
+  * Uses a `GenStage` process, the data source becomes a producer
+  * By default, uses `System.schedulers_online/0` to determine how to parallelize
+  * Any data structure can be used as a data source if it implements the `Enumerable` protocol, but it is better to use streams
+    * for example, Ecto provides `Repo.stream/1`
+
+* `Flow.map/2` and `Flow.filter/2` act as `:consumer` or `:producer_consumer` stages
+
+## Performing Reduce Concurrently with Partitions
+
+```elixir
+# defmodule Airports do
+#   alias NimbleCSV.RFC4180, as: CSV
+
+#   def airports_csv() do
+#     "/Users/sam/Documents/elixir_book_club/concurrent_data_processing/airports.csv"
+#   end
+
+#   def open_airports_v1() do
+#     airports_csv()
+#     |> File.stream!()
+#     |> Flow.from_enumerable()
+#     |> Flow.map(fn row ->
+#       [row] = CSV.parse_string(row, skip_headers: false)
+
+#       %{
+#         id: Enum.at(row, 0),
+#         type: Enum.at(row, 2),
+#         name: Enum.at(row, 3),
+#         country: Enum.at(row, 8)
+#       }
+#     end)
+#     |> Flow.reject(&(&1.type == "closed"))
+#     |> Flow.partition(key: {:key, :country})
+#     |> Flow.reduce(fn -> %{} end, fn item, acc ->
+#       Map.update(acc, item.country, 1, &(&1 + 1))
+#     end)
+#     |> Enum.to_list()
+#   end
+
+#   def open_airports_v2() do
+#     airports_csv()
+#     |> File.stream!()
+#     |> Flow.from_enumerable()
+#     |> Flow.map(fn row ->
+#       [row] = CSV.parse_string(row, skip_headers: false)
+
+#       %{
+#         id: Enum.at(row, 0),
+#         type: Enum.at(row, 2),
+#         name: Enum.at(row, 3),
+#         country: Enum.at(row, 8)
+#       }
+#     end)
+#     |> Flow.reject(&(&1.type == "closed"))
+#     |> Flow.partition(key: {:key, :country})
+#     |> Flow.group_by(&(&1.country))
+#     |> Flow.map(fn {country, data} -> {country, Enum.count(data)} end)
+#     |> Enum.to_list()
+#   end
+
+#   def open_airports_v3() do
+#     airports_csv()
+#     |> File.stream!()
+#     |> Flow.from_enumerable()
+#     |> Flow.map(fn row ->
+#       [row] = CSV.parse_string(row, skip_headers: false)
+
+#       %{
+#         id: Enum.at(row, 0),
+#         type: Enum.at(row, 2),
+#         name: Enum.at(row, 3),
+#         country: Enum.at(row, 8)
+#       }
+#     end)
+#     |> Flow.reject(&(&1.type == "closed"))
+#     |> Flow.partition(key: {:key, :country})
+#     |> Flow.group_by(&(&1.country))
+#     |> Flow.map(fn {country, data} -> {country, Enum.count(data)} end)
+#     |> Flow.take_sort(8, fn {_, a}, {_, b} -> a > b end)
+#     |> Enum.to_list()
+#     |> List.flatten()
+#   end
+# end
+```
+
+```elixir
+# 0.2s ~
+# :timer.tc(&Airports.open_airports_v1/0)
+
+# 0.2s ~
+# :timer.tc(&Airports.open_airports_v2/0)
+
+:timer.tc(&Airports.open_airports_v3/0)
+```
+
+* examples use `Enum.to_list/0` to force them to run and produce a result, but you can use `Flow.run/1` instead if you are not interested in the final result. It works similar to `Stream.run/1` and always returns `:ok`
+
+## Using Windows and Triggers
+
+* All events going through `Flow` are grouped together by a window
+  * Kinda like folders for events
+  * So far we have used `Flow.Window.global/0` which creates a global window
+  * Other types of windows:
+    * `Flow.Window.fixed/3` groups events by a timestamp value on the event, using specified time duration
+    * `Flow.Window.periodic/2` is like fixed by groups events by processing time
+    * `Flow.Window.count/1` groups events when they reach the given count
+* At the beginning of a window, the accumulator is reset so it can restart collecting data from scratch
+* You can also specify a trigger for each window
+  * Triggers work like checkpoints and all trigger functions take a window as their first arg
+  * When a trigger event occurs, you have the opportunity to take data out of the flow by specifying what events to emit
+  * Types of triggers:
+    * `Flow.Window.trigger_every/2` triggers when you reach the given count of events
+    * `Flow.Window.trigger_periodically/3` triggers at the specified time duration
+    * `Flow.Window.trigger/3` is used for implementing custom triggers
+* Use `Flow.on_trigger/2` to run some code whenever a trigger occurs
+  * takes an existing flow as its first arg and a callback fn
+  * callback accepts: latest accuumulator from the reducer, partition info as a tuple, window info as a tuple
+
+```elixir
 defmodule Airports do
   alias NimbleCSV.RFC4180, as: CSV
 
   def airports_csv() do
     "/Users/sam/Documents/elixir_book_club/concurrent_data_processing/airports.csv"
   end
+
+  def open_airports_v1() do
+    window = Flow.Window.trigger_every(Flow.Window.global(), 1000)
+
+    airports_csv()
+    |> File.stream!()
+    |> Stream.map(fn event ->
+      Process.sleep(Enum.random([0, 0, 0, 1]))
+      event
+    end)
+    |> Flow.from_enumerable()
+    |> Flow.map(fn row ->
+      [row] = CSV.parse_string(row, skip_headers: false)
+
+      %{
+        id: Enum.at(row, 0),
+        type: Enum.at(row, 2),
+        name: Enum.at(row, 3),
+        country: Enum.at(row, 8)
+      }
+    end)
+    |> Flow.reject(&(&1.type == "closed"))
+    |> Flow.partition(window: window, key: {:key, :country})
+    |> Flow.group_by(& &1.country)
+    |> Flow.on_trigger(fn acc, _partition_info, {_type, _id, trigger} ->
+      # show progress in iex
+      events =
+        acc
+        |> Enum.map(fn {country, data} -> {country, Enum.count(data)} end)
+        |> IO.inspect(label: inspect(self()))
+
+      case trigger do
+        :done ->
+          {events, acc}
+
+        {:every, 1000} ->
+          {[], acc}
+      end
+    end)
+    |> Enum.to_list()
+  end
 end
 ```
+
+```elixir
+Airports.open_airports_v1()
+```
+
+## Adding Flow to a GenStage Pipeline
+
+When it comes to working with `GenStage` there are two groups of functions to use
+
+First group is made to work with already running stages:
+
+* `from_stages/2` to receive events from `:producer` stages
+* `through_stages/3` to send events to `:producer_consumer` stages and receive what they send in turn
+* `into_stages/3` to send events to `:consumer` or `:producer_consumer` stages
+
+Requires a list of PIDs to connect to the already running processes ^
+
+Second group of fns is useful when you want `Flow` to start the `GenStage` processes for you
+
+* `from_specs/2`
+* `through_specs/3`
+* `into_specs/3`
+
+Work the same as the previous list except they require a list of tuples instead of PIDS.
+Each tuple reps a child spec, flow uses them to start the processes for you
+
+> “Coordinating events and processes when using into_stages/3 and through_stages/3 could be complicated. If you are using them to process finite data, you have to be careful how processes exit—see the documentation for more information”
+
+* You get the best results from Flow only when you use it with large data sets
+  * Because they create and manage processes
