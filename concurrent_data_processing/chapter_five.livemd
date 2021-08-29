@@ -14,7 +14,8 @@ Mix.install([
 defmodule ApplicationBroadway do
   def start(_type, _args) do
     children = [
-      BookingsPipeline
+      BookingsPipeline,
+      NotificationsPipeline
     ]
 
     opts = [strategy: :one_for_one, name: Tickets.Supervisor]
@@ -55,24 +56,41 @@ defmodule BookingsPipeline do
       name: BookingsPipeline,
       producer: [module: {@producer, @producer_config}],
       processors: [default: []],
-      batchers: [default: []]
+      batchers: [cinema: [], musical: [], default: []]
     ]
 
     Broadway.start_link(__MODULE__, options)
   end
 
   def handle_message(_processor, message, _context) do
-    %{data: %{event: event, user: user}} = message
+    if Tickets.tickets_available?(message.data.event) do
+      case message do
+        %{data: %{event: "cinema"}} = message ->
+          Broadway.Message.put_batcher(message, :cinema)
 
-    if Tickets.tickets_available?(event) do
-      Tickets.create_ticket(user, event)
-      Tickets.send_email(user)
+        %{data: %{event: "musical"}} = message ->
+          Broadway.Message.put_batcher(message, :musical)
 
-      IO.inspect(message, label: "Message")
+        message ->
+          message
+      end
     else
       Broadway.Message.failed(message, "bookings-closed")
     end
   end
+
+  # def handle_message(_processor, message, _context) do
+  #   %{data: %{event: event, user: user}} = message
+
+  #   if Tickets.tickets_available?(event) do
+  #     Tickets.create_ticket(user, event)
+  #     Tickets.send_email(user)
+
+  #     IO.inspect(message, label: "Message")
+  #   else
+  #     Broadway.Message.failed(message, "bookings-closed")
+  #   end
+  # end
 
   def handle_failed(messages, _context) do
     IO.inspect(messages, label: "Failed messages")
@@ -98,7 +116,6 @@ defmodule BookingsPipeline do
     users = Tickets.users_by_ids(Enum.map(messages, & &1.data.user_id))
 
     # put users in messages
-
     Enum.map(messages, fn message ->
       Broadway.Message.update_data(message, fn data ->
         user = Enum.find(users, &(&1.id == data.user_id))
@@ -109,8 +126,22 @@ defmodule BookingsPipeline do
 
   def handle_batch(_batcher, messages, batch_info, _context) do
     IO.inspect(batch_info, label: "#{inspect(self())} batch")
+
+    messages
+    |> Tickets.insert_all_tickets()
+    |> Enum.each(fn message ->
+      channel = message.metadata.amqp_channel
+      payload = "email,#{message.data.user.email}"
+      AMQP.Basic.publish(channel, "", "notifications_queue", payload)
+    end)
+
     messages
   end
+
+  # def handle_batch(_batcher, messages, batch_info, _context) do
+  #   IO.inspect(batch_info, label: "#{inspect(self())} batch")
+  #   messages
+  # end
 end
 ```
 
@@ -144,6 +175,12 @@ defmodule Tickets do
   def users_by_ids(ids) when is_list(ids) do
     # normally this would be a db query
     Enum.filter(@users, &(&1.id in ids))
+  end
+
+  def insert_all_tickets(messages) do
+    # normally ectco insert all
+    Process.sleep(Enum.count(messages) * 250)
+    messages
   end
 end
 ```
@@ -190,6 +227,89 @@ end
 `%BatchInfo{}`
 
 * `batcher` is the batcher group and belongs to one of the groups defined in `starlink/1`
+
 * `:batch_key` is an id for a gorup of messages in the batch
+
 * `:partition` is the partition key if configured
+
 * `:size` is the number of messages in the batch
+
+* by default you get one processeor per batcher, can be increased using the `:concurrency` key on each batcher group
+
+#### Dynamic Batching
+
+* Broadway lets you define batches at runtime with `:batch_key` called *dynamic batching*
+* Done by calling `Broadway.Message.put_batch_key/2` in your `handle_message/3` callback
+
+```elixir
+defmodule NotificationsPipeline do
+  use Broadway
+
+  @producer BroadwayRabbitMQ.Producer
+
+  @producer_config [
+    queue: "notifcations_queue",
+    declare: [durable: true],
+    on_failure: :reject_and_requeue,
+    qos: [prefetch_count: 100]
+  ]
+
+  def start_link(_args) do
+    options = [
+      name: NotificationsPipeline,
+      producer: [module: {@producer, @producer_config}],
+      processors: [default: []],
+      batchers: [
+        email: [concurrency: 5, batch_timeout: 10_000]
+      ]
+    ]
+
+    Broadway.start_link(__MODULE__, options)
+  end
+
+  def handle_message(message, _context) do
+    message
+    |> Broadway.Message.put_batcher(:email)
+    |> Broadway.Message.put_batch_key(message.data.recipient)
+  end
+
+  def prepare_messages(messages, _context) do
+    Enum.map(messages, fn message ->
+      Broadway.Message.update_data(messages, fn data ->
+        [type, recipient] = String.split(data, ",")
+        %{type: type, recipient: recipient}
+      end)
+    end)
+  end
+
+  def handle_batch(_batcher, messages, batch_info) do
+    IO.puts("#{inspect(self())} Batch #{batch_info}")
+
+    messages
+  end
+end
+```
+
+#### Adjusting Batch Size and Timeout
+
+* `:batch_size` controls the number of messages in a batch
+* `:batch_timeout` controls the amount of time the processor waits before sending batch
+* ^ work on per-batch key basis
+
+## Wrapping Up
+
+* Broadway simplifies working with message brokers (like rabbitmq) & takes away the complexity of assembling data-processing pipelines
+
+* `Task` module is good for perofrming concurrent work without much hassle
+
+  * Using `Task.aync_stream/3` is a good way to process large collections of data and provide back pressure
+
+* `GenServer` is good for creating processes that maintain their own state and exist for long periods of time
+
+* `GenStage` enables you to create complex data-processing pipelines that are resilent by controlling consumer demand and back-pressure
+
+* `Flow` helps aggregate data by using `GenStage` - good for working with big datasets and doing transformations
+
+* `Broadway` fills a gap when building data ingestion pipelines that consume external events
+
+  * You can use it with message brokers and to build robust event-processing systems
